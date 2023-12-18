@@ -105,8 +105,9 @@ if __name__ == "__main__":
 
     #path='/home/ryan/Documents/Data/3D/cache/nbv/'
     #getCenter()
-    path = r"C:\Users\hasee\Desktop\Data\3dPointCloud"
-    pcd = o3d.io.read_point_cloud(os.path.join(path, '8.ply'))
+    path = r"D:\data\3d"
+    pcd = o3d.io.read_point_cloud(os.path.join(path, 'final.ply'))
+    #pcd = pcd.voxel_down_sample(voxel_size=5)
     alpha = 0.1
     print(f"alpha={alpha:.3f}")
 

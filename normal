@@ -1,0 +1,471 @@
+
+import numpy as np
+import open3d as o3d
+import open3d.core as o3c
+import pickle
+import cv2
+import os
+from parseri_prototype import args
+import matplotlib.pyplot as plt
+import numpy as np
+from scipy.optimize import nnls
+from matplotlib import cm
+import random
+import time
+import copy
+
+class Gripper:
+    def __init__(self, args):
+        # Deal with .ply, use gripper_cups_x*gripper_cups_y cups to suck subject up.  select the center
+        self.args = args
+        self.pcd = o3d.io.read_point_cloud(os.path.join(self.args.ground_path, self.args.plyfile))
+        temp_numpy = np.asarray(self.pcd.points)
+        temp_numpy[:,1]=temp_numpy[:,1]*self.args.scan_y
+        self.pcd.points = o3d.utility.Vector3dVector(temp_numpy)
+        self.dearea() # limit the DOI
+        self.pcd_raw =  copy.deepcopy(self.pcd)
+        self.center=[]
+        self.volume = []
+        self.weight=0
+        self.z_back=0
+        self.plane_model=[]
+        self.potential_grasp=[]
+        self.rota_axis=[]
+        self.plane_rota_angle=[]
+        self.plot_enable=True
+        self.early_stop=self.args.earlystop
+        self.plane_model, self.plane_inliers = self.pcd.segment_plane(distance_threshold=self.args.deplan_distance,ransac_n=3,num_iterations=1000)
+        if os.path.exists(args.gripper_rotation_pickle):
+            with open(args.gripper_rotation_pickle, "rb") as input_file:
+                self.gripper_rotations = pickle.load(input_file)
+
+    def d3_show(self,z):
+        fig, ax = plt.subplots(subplot_kw={"projection": "3d"})
+        X = np.arange(z.shape[1])
+        Y = np.arange(z.shape[0])
+        X, Y = np.meshgrid(X, Y)
+        Z = z
+        surf = ax.plot_surface(X, Y, Z, cmap=cm.coolwarm,
+                            linewidth=0, antialiased=False)
+        fig.colorbar(surf, shrink=0.5, aspect=5)
+        plt.show()
+
+    def demo_show(self,item_1,*vartuple):
+        # plot cloud point
+        if self.plot_enable:
+            center_= item_1.get_center()
+            mesh = o3d.geometry.TriangleMesh.create_coordinate_frame()
+
+            cube = o3d.geometry.TriangleMesh.create_box()
+            cube.scale(self.args.weightcentershowsize, center=cube.get_center())
+            center_[2]=0
+            cube.translate(center_, relative=False,)
+            cube.compute_vertex_normals()
+
+            vis = o3d.visualization.Visualizer()
+            vis.create_window()
+            vis.add_geometry(mesh)
+            #vis.add_geometry(cube)
+            vis.add_geometry(item_1)
+            for var in vartuple:
+                vis.add_geometry(var)  
+            vis.poll_events()
+            vis.update_renderer()
+            vis.run()
+
+    def rotate_image(self, img, angle):
+        def rotate_clean_around(rotated_img):
+            ck=np.where(rotated_img>0)
+            record=[]
+            for k in range(ck[0].shape[0]-1):
+                x=ck[0][k+1:min(k+20,ck[0].shape[0])]
+                y=ck[1][k+1:min(k+20,ck[0].shape[0])]
+                z=(x-ck[0][k])**2+(y-ck[1][k])**2
+                if min(z)>5**2:
+                    #print(z)
+                    record.append(k)
+            record.append(ck[0].shape[0]-1)
+            temp=np.zeros(rotated_img.shape,dtype='uint8')
+            temp[ck[0][record],ck[1][record]]=1
+            if len(record)!=self.args.gripper_cups_x*self.args.gripper_cups_y:
+                print('Error Need to check')
+                print(ck[0][record])
+                print(ck[1][record])
+                plt.matshow(temp, cmap=plt.cm.Reds)
+                plt.show()
+                i=9
+            return temp
+        h, w = img.shape[:2]
+        rotate_center = (w/2, h/2)
+        M = cv2.getRotationMatrix2D(rotate_center, angle*180/np.pi, 1.0)
+        rotated_img = cv2.warpAffine(img, M, (w, h),flags=cv2.INTER_NEAREST)
+        rotated_img=rotate_clean_around(rotated_img)
+        return rotated_img
+
+    def rotation_gripper(self):
+        #use only once
+        grip_x_range=int(self.args.gripper_cups_x*self.args.gripper_cups_d*1.5//self.args.resolution_catch)
+        grip_y_range=int(self.args.gripper_cups_y*self.args.gripper_cups_d*1.5//self.args.resolution_catch)
+        grip_num=np.zeros([grip_y_range,grip_x_range],dtype='int32')
+        t=int(self.args.gripper_cups_d//self.args.resolution_catch)
+        bias_y=int(grip_num.shape[0]/2)-int((self.args.gripper_cups_y-1)*t/2)
+        bias_x=int(grip_num.shape[1]/2)-int((self.args.gripper_cups_x-1)*t/2)
+        for i in range(-1,1,1):
+            for k in range(-1,1,1):
+                grip_num[bias_y-i:int(self.args.gripper_cups_y*t)+bias_y-i:t,\
+                         bias_x-k:int(self.args.gripper_cups_x*t)+bias_x-k:t]=10 
+        #plt.matshow(grip_num, cmap=plt.cm.Reds)
+        #plt.show()
+        grip_num=grip_num.astype(np.uint8)
+        temp=[]
+        angle_r=np.arange(0,np.pi/2,np.pi/180)
+        for i in angle_r:
+            tt_t=self.rotate_image(grip_num, i)
+            if i>0:
+                if abs(np.sum(tt_t-temp[-1]))>2:
+                    #print(i/np.pi*180)
+                    temp.append(tt_t)
+                    #plt.matshow(tt_t, cmap=plt.cm.Reds)
+            else:
+                temp.append(tt_t)
+        #plt.show()
+        t_=np.stack(temp,axis=2)
+        #pickle.dump(t_,self.args.gripper_rotation_pickle)
+        with open(self.args.gripper_rotation_pickle, "wb") as output_file:
+            pickle.dump(t_, output_file)
+
+    def calculate_balance(self,pot_points,center):
+        one_tor=np.ones(pot_points[0].shape[0])
+        if pot_points[0].shape[0]<self.weight//self.args.max_load:
+            return [False,0]
+        else:
+            x_tor=pot_points[0]-center[0]
+            y_tor=pot_points[1]-center[1]
+            A=np.zeros([3,pot_points[0].shape[0]])
+            A[0,:]=one_tor
+            A[1,:]=x_tor
+            A[2,:]=y_tor
+            b=np.array([self.weight,0,0])
+            x,rnorm=nnls(A,b)
+            for i in x:
+                if i>self.args.max_load:
+                    return [False,0]
+            if rnorm<self.args.max_residual:
+                print(x)
+                print(rnorm)
+                return [True,rnorm]
+            else:
+                return [False,0]
+                
+    def best_select(self, inf,grp,img):
+        if type(inf) == np.ndarray:
+            t_=inf
+            grp_=grp
+            img_=img
+        else:
+            t_=np.array(inf)
+            grp_=np.array(grp)
+            img_=np.array(img)
+        num_max=np.where(t_[...,1]==np.max(t_[...,1]))
+        t_=t_[num_max]
+        grp_=grp_[num_max]
+        img_=img_[num_max]
+        residual_min=np.where(t_[...,2]==np.min(t_[...,2]))
+        t_=t_[residual_min]
+        grp_=grp_[residual_min]
+        img_=img_[residual_min]
+        if t_.shape[0]>1:
+            i=random.randint(0, t_.shape[0]-1)
+            t_=t_[i,:]
+            grp_=grp_[i,:,:]
+            img_=img_[i,:,:]
+        else:
+            t_=t_[0,:]
+            grp_=grp_[0,:,:]
+            img_=img_[0,:,:]
+            print('Only 1 max point')
+        return t_.reshape(1,-1),grp_,img_
+    
+    def balance_select(self, map,gripers,center,imag,imag_high):
+        points=map*gripers
+        feedback_inf=[]
+        feedback_grip=[]
+        feedback_ima=[]
+        wk=np.sum(points,axis = (0,1))
+        for i,item in enumerate(wk):
+            if item>0:
+                point_cand=np.where(gripers[:,:,i]>0)
+                point_grippers=np.zeros([self.args.gripper_cups_x*self.args.gripper_cups_y,3])
+                point_grippers[:,0]=point_cand[1]
+                point_grippers[:,1]=point_cand[0]
+                point_grippers[:,2]=imag_high[point_cand[0],point_cand[1],0]
+                ck=np.where(points[:,:,i]>0)
+                temp_score=self.calculate_balance(ck,center)
+                if temp_score[0]:
+                    #plt.matshow(imag[:,:,i], cmap=plt.cm.Reds)
+                    #plt.show()
+                    feedback_inf.append(np.array([i,ck[0].shape[0],temp_score[1]]))# angle, grippers, residual, image
+                    feedback_grip.append(point_grippers)
+                    feedback_ima.append(imag[:,:,i])
+                #plt.matshow(imag[:,:,i], cmap=plt.cm.Reds)
+                #plt.show()
+        if len(feedback_inf)>0:
+            inf_return,gri_return,img_return=self.best_select(feedback_inf,feedback_grip,feedback_ima)
+        else:
+            inf_return,gri_return,img_return=np.array([[0,0,0]]),\
+                np.zeros([self.args.gripper_cups_x*self.args.gripper_cups_y,3]),\
+                    np.zeros([map.shape[0],map.shape[1]])
+        return inf_return,gri_return,img_return
+
+    def unit_angle(self,xyz):
+        # resize vector into unit
+        return xyz/np.linalg.norm(xyz)
+    
+    def vectors_internal_angle(self,vector1,vector2):
+        # the angle betwenn vectors
+        dot_r=np.dot(vector1,vector2)
+        abs_p=np.linalg.norm(vector1)*np.linalg.norm(vector2)
+        return np.arccos(dot_r/abs_p)
+    
+    def vectorangle2quaternion(self,vector,angle):
+        # resize vector into unit
+        """
+        mesh = o3d.geometry.TriangleMesh.create_coordinate_frame()
+        ccc=np.zeros(3)
+        ccc[2]=1
+        temp_qua=self.vectorangle2quaternion(ccc,np.pi)
+        R3 = mesh.get_rotation_matrix_from_quaternion(list(temp_qua))
+        mesh.rotate(R3)
+        """
+        temp=np.zeros(4)
+        temp[0]=np.cos(angle/2)
+        temp[1:]=self.unit_angle(vector)*np.sin(angle/2)
+        return temp
+
+    def denoise(self):
+        # delete outlier to deduce noise
+        temp=self.pcd.voxel_down_sample(voxel_size=self.args.denoise_sampling)
+        cl, ind = temp.remove_statistical_outlier(nb_neighbors=self.args.denoise_neighb,std_ratio=self.args.denoise_std)
+        self.pcd = temp.select_by_index(ind, invert=False)
+
+    def dearea(self): 
+        # select x and y range of a cloud to deduce noise
+        temp_numpy = np.asarray(self.pcd.points)
+        indices = np.where((temp_numpy[:,0]>self.args.deareax[0]) & (temp_numpy[:,0]<self.args.deareax[1]) &(temp_numpy[:,1]>self.args.deareay[0]) & (temp_numpy[:,1]<self.args.deareay[1]) &(temp_numpy[:,2]>self.args.deareaz[0]) & (temp_numpy[:,2]<self.args.deareaz[1])  )[0]
+        self.pcd = self.pcd.select_by_index(indices)
+
+    def deplane(self):
+        # delete plane inside cloud.
+        self.plane_model, inliers = \
+                self.pcd.segment_plane(distance_threshold=self.args.deplan_distance,ransac_n=3,num_iterations=1000)    
+        [a, b, c, d] = self.plane_model
+        print(f"Plane equation: {a:.2f}x + {b:.2f}y + {c:.2f}z + {d:.2f} = 0")
+        self.pcd = self.pcd.select_by_index(inliers, invert=True)
+        self.z_back=-d
+        self.pcd.translate([0,0,d], relative=True,)
+
+    def plane_rotate(self,direction):
+        # delete plane inside cloud.
+        if direction=='tonormal':
+            self.rota_axis=np.cross(self.plane_model[:3],np.asarray([0,0,1]))
+            self.plane_rota_angle=self.vectors_internal_angle(self.plane_model[:3],np.asarray([0,0,1]))
+            temp_qua=self.vectorangle2quaternion(self.rota_axis,self.plane_rota_angle)
+            R3 = self.pcd.get_rotation_matrix_from_quaternion(list(temp_qua))
+            self.pcd.rotate(R3,center=[0,0,0])
+        else:
+            self.plane_rota_angle=-self.plane_rota_angle
+
+            temp_pcd_point=np.zeros([self.args.gripper_cups_x*self.args.gripper_cups_y+1,3])
+            temp_pcd_point[0,:]=self.pcd_best_inf[0,3:]
+            temp_pcd_point[1:,:]=self.pcd_best_grip
+            grip_pcd = o3d.geometry.PointCloud()
+            grip_pcd.points = o3d.utility.Vector3dVector(temp_pcd_point)
+
+            grip_pcd.translate([0,0,self.z_back], relative=True,) #high back
+
+            temp_qua=self.vectorangle2quaternion(self.rota_axis,self.plane_rota_angle)
+            R3 = grip_pcd.get_rotation_matrix_from_quaternion(list(temp_qua))
+            grip_pcd.rotate(R3,center=[0,0,0])
+            temp_pcd_point=np.asarray(grip_pcd.points)
+            self.pcd_best_inf[0,3:]=temp_pcd_point[0,:]
+            self.pcd_best_grip=temp_pcd_point[1:,:]
+            R3 = self.pcd.get_rotation_matrix_from_quaternion(list(temp_qua))
+            self.pcd.rotate(R3,center=[0,0,0])
+        
+
+    def calVolume(self):
+        np_low=np.asarray(self.pcd.points)
+        volume=np.sum(np_low[:,2])*0.01
+        self.weight=volume* self.args.density*0.000000001
+        print("Weight = "+ str(self.weight))
+
+    def normal_selection(self,tar):
+        # select the point cluster which has a upper normal
+        tar.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamKNN(knn=self.args.normal_selection_knn))
+        z_coords = np.asarray(tar.normals)[:, 2]
+        indices = np.where(z_coords > self.args.normal_range)[0]
+        return tar.select_by_index(indices)
+
+    def marginal_selection(self,tar):
+        # select the position where a cup can point
+        cl, ind = tar.remove_radius_outlier(nb_points=self.args.cup_points, radius=self.args.cup_radius)
+        return tar.select_by_index(ind, invert=False)
+    
+    def coordinate_correct(self,sim_xy,row,col,min_x,min_y):
+        sim_xy[:,0]=(sim_xy[:,0]+col-self.gripper_rotations.shape[0])*self.args.resolution_catch+min_x
+        sim_xy[:,1]=(sim_xy[:,1]+row-self.gripper_rotations.shape[1])*self.args.resolution_catch+min_y
+        return sim_xy
+    
+    def virtual_gripper(self,grips):
+        # inf_: rotation angle, cups, residual, center x, center y, center z
+        mesh=[]
+        for i in range(grips.shape[0]):
+            cube = o3d.geometry.TriangleMesh.create_sphere(radius=self.args.cup_radius)
+            cube.translate((grips[i,:]),relative=False,)
+            if mesh == []:
+                mesh=cube
+            else:
+                mesh += cube
+        return mesh
+
+    def estimate_gripper(self,clooud):
+        np_low=np.asarray(clooud.points)[:,:]
+        temp_x_range=int((max(np_low[:,0])-min(np_low[:,0]))//self.args.resolution_catch)
+        temp_y_range=int((max(np_low[:,1])-min(np_low[:,1]))//self.args.resolution_catch)
+        item_array = np.zeros([temp_y_range+1+self.gripper_rotations.shape[0]*2,\
+                               temp_x_range+1+self.gripper_rotations.shape[1]*2,1],dtype='int32')
+        high_array=np.zeros([temp_y_range+1+self.gripper_rotations.shape[0]*2,\
+                               temp_x_range+1+self.gripper_rotations.shape[1]*2,1],dtype='int32')
+        min_x = (min(np_low[:,0]))
+        min_y = (min(np_low[:,1]))
+        grip_step=2*min(temp_x_range,temp_y_range)//self.args.potential_position_internal+1
+        for np_ in np_low:
+            x, y,z = np_
+            item_array[int((y-min_y)/self.args.resolution_catch+self.gripper_rotations.shape[0]), \
+                       int((x-min_x)/self.args.resolution_catch+self.gripper_rotations.shape[0]),0] = 1
+            high_array[int((y-min_y)/self.args.resolution_catch+self.gripper_rotations.shape[0]), \
+                       int((x-min_x)/self.args.resolution_catch+self.gripper_rotations.shape[0]),0] = z
+        center_xx=int((self.center[0]-min_x)/self.args.resolution_catch+self.gripper_rotations.shape[0])
+        center_yy=int((self.center[1]-min_y)/self.args.resolution_catch+self.gripper_rotations.shape[0])
+        print(center_xx)
+        print(center_yy)
+        nozero_array=np.nonzero(item_array)
+        nozero_gr=np.nonzero(self.gripper_rotations)
+
+        grip_y_mi=min(nozero_gr[0])
+        grip_y_ma=max(nozero_gr[0])
+        grip_x_mi=min(nozero_gr[1])
+        grip_x_ma=max(nozero_gr[1])
+
+        a_y_mi=min(nozero_array[0])
+        a_y_ma=max(nozero_array[0])
+        a_x_mi=min(nozero_array[1])
+        a_x_ma=max(nozero_array[1])
+
+        y_start=a_y_mi-grip_y_ma
+        x_start=a_x_mi-grip_x_ma
+        y_end=a_y_ma-grip_y_mi
+        x_end=a_x_ma-grip_x_mi
+        self.infor_grip=np.zeros([(y_end-y_start)// grip_step+1,\
+                                  (x_end-x_start)// grip_step+1,\
+                                    6])
+        self.posi_grip=np.zeros([(y_end-y_start)// grip_step+1,\
+                                  (x_end-x_start)// grip_step+1,\
+                                    self.args.gripper_cups_x*self.args.gripper_cups_y,3])
+        self.image_grip=np.zeros([(y_end-y_start)// grip_step+1,\
+                                  (x_end-x_start)// grip_step+1,\
+                                    self.gripper_rotations.shape[0],self.gripper_rotations.shape[0]])
+        for row in range(y_start, y_end, grip_step):
+            for col in range(x_start, x_end, grip_step):
+                temp=item_array[row:row+self.gripper_rotations.shape[0],col:col+self.gripper_rotations.shape[0],:]
+                temp_high=high_array[row:row+self.gripper_rotations.shape[0],col:col+self.gripper_rotations.shape[0],:]
+                if np.sum(temp)>0:
+                    #print('row: {}'.format(row))
+                    #print('col: {}'.format(col))
+                    img_comb=temp+self.gripper_rotations
+                    rotation_good_inf,rotation_good_grip,rotation_good_ima=self.balance_select(temp,self.gripper_rotations,[center_yy-row,center_xx-col],img_comb,temp_high)
+                    corrected_inf=np.concatenate((rotation_good_inf,self.coordinate_correct(np.array([[self.gripper_rotations.shape[0]/2,self.gripper_rotations.shape[0]/2,0]]),row,col,min_x,min_y)),axis=1)
+                    corrected_grip=self.coordinate_correct(rotation_good_grip,row,col,min_x,min_y)
+                    self.infor_grip[(row-y_start)//grip_step,(col-x_start)//grip_step,:]=corrected_inf
+                    self.posi_grip[(row-y_start)//grip_step,(col-x_start)//grip_step,:,:]=corrected_grip
+                    self.image_grip[(row-y_start)//grip_step,(col-x_start)//grip_step,:,:]=rotation_good_ima
+                    if self.early_stop:
+                        if (corrected_inf[0,2]<self.args.threhold_residual) and (corrected_inf[0,1]>=np.ceil(self.weight/self.args.max_load)*self.args.earlystop_safty_buffer):
+                            best_inf,best_grip,best_img=corrected_inf,corrected_grip,rotation_good_ima
+                            print(best_inf)
+                            return best_inf,best_grip,best_img  
+        best_inf,best_grip,best_img=self.best_select(self.infor_grip,self.posi_grip,self.image_grip)
+        print(best_inf)
+        """
+        np.zeros([1,6]),\
+                np.zeros([self.args.gripper_cups_x*self.args.gripper_cups_y,3]),\
+                    np.zeros([self.image_grip.shape[2],self.image_grip.shape[3]])
+        """
+        return best_inf,best_grip,best_img
+
+
+    def calpipline(self):
+        """
+        try:
+            self.demo_show(self.pcd) # original 3d
+            self.dearea() # limit the DOI
+            self.demo_show(self.pcd) # draw
+            self.deplane() # delete the plane
+            self.demo_show(self.pcd)
+            self.plane_rotate('tonormal') # transfer cooperation from random to z axis upward
+            self.demo_show(self.pcd)
+            self.denoise() # delete noise
+            self.center = self.pcd.get_center() #calculate the weight center
+            self.calVolume()
+            self.pcd_selected=self.normal_selection(self.pcd)
+            self.demo_show(self.pcd_selected)
+            self.pcd_selected=self.marginal_selection(self.pcd_selected)
+            self.demo_show(self.pcd_selected)
+            self.pcd_best_inf,self.pcd_best_grip,self.pcd_best_img=self.estimate_gripper(self.pcd_selected)
+            #self.demo_show(self.pcd,self.virtual_gripper(self.pcd_best_grip))
+            if self.pcd_best_inf[0,1]!=0:
+                self.plane_rotate('toreal') # transfer gripers from z axis to original
+                self.demo_show(self.pcd,self.virtual_gripper(self.pcd_best_grip))
+            print(self.pcd_best_grip)
+        except:
+            self.pcd_best_grip=0
+            print('Error Happens')
+        k=9
+        """
+        start = time.time()
+        self.demo_show(self.pcd) # original 3d
+        self.deplane() # delete the plane
+        self.demo_show(self.pcd)
+        self.plane_rotate('tonormal') # transfer cooperation from random to z axis upward
+        self.demo_show(self.pcd)
+        self.denoise() # delete noise
+        self.center = self.pcd.get_center() #calculate the weight center
+        self.calVolume()
+        self.pcd_selected=self.normal_selection(self.pcd)
+        self.demo_show(self.pcd_selected)
+        self.pcd_selected=self.marginal_selection(self.pcd_selected)
+        self.demo_show(self.pcd_selected)
+        end = time.time()
+        print('3D Execute Time: ',end - start)
+        start = time.time()
+        self.pcd_best_inf,self.pcd_best_grip,self.pcd_best_img=self.estimate_gripper(self.pcd_selected)
+        end = time.time()
+        print('Best Position Execute time: ',end - start)
+        #self.demo_show(self.pcd,self.virtual_gripper(self.pcd_best_grip))
+        if self.pcd_best_inf[0,1]!=0:
+            #plt.matshow(self.pcd_best_img, cmap='viridis')
+            #plt.show()
+            self.plane_rotate('toreal') # transfer gripers from z axis to original
+            self.demo_show(self.pcd_raw,self.virtual_gripper(self.pcd_best_grip))
+        print(self.pcd_best_inf)
+        
+
+
+
+
+
+if __name__ == "__main__":
+    item_3d=Gripper(args)
+    item_3d.calpipline()
+
+    
